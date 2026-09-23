@@ -965,12 +965,12 @@ def render_help_text(owner):
             "• 链接 — 浏览、搜索、分步添加、修改、删除\n"
             "• 系统 — 统计、关于、延迟、ID\n\n"
             "回复我转发来的消息，会直接回给那个人。\n"
-            "没有在回复某条转发时，你发出的内容会发给「当前对象」。\n"
+            "没有在回复某条转发时，你发出的文字、图片、文件和语音会发给「当前对象」。\n"
             "菜单正在等你输入时，下一条文字只用于当前步骤。点「取消」可退出。"
         )
     return (
         "❓ 帮助\n\n"
-        "直接发消息即可匿名转达。\n"
+        "直接发文字、图片或文件即可匿名转达。\n"
         "/menu 可以查看链接、测延迟、看自己的 ID。"
     )
 
@@ -1679,7 +1679,7 @@ def _menu_do(call, parts, chat_id, msg_id, user_id):
         set_pending(user_id, "send", sid=sid, page=page, chat_id=chat_id, msg_id=msg_id)
         show_screen(
             chat_id, msg_id,
-            f"✉️ 发给 {name} (ID: {sid})\n\n请直接发送内容。下一条文字只会发给这个人。",
+            f"✉️ 发给 {name} (ID: {sid})\n\n请直接发送文字、图片或文件。下一条内容只会发给这个人。",
             cancel_kb(f"m|user|{sid}|{page}"),
         )
         _ack(call, "请发送内容")
@@ -1748,6 +1748,8 @@ def consume_menu_input(message):
         clear_pending(user_id)
         return False
     if not text:
+        if pending.get("flow") == "send":
+            return _consume_send_media(message, user_id, pending)
         bot.reply_to(message, "这一步需要文字。请发送文字，或点菜单里的「取消」。")
         return True
 
@@ -1810,6 +1812,43 @@ def _consume_send(message, user_id, pending, text):
     name = _conv_name(conv)
     clear_pending(user_id)
     bot.reply_to(message, f"✅ 已发送给 {name} (ID: {sid})")
+    show_user(pending.get("chat_id"), pending.get("msg_id"), sid, page, banner="✅ 已发送")
+    return True
+
+
+def _consume_send_media(message, user_id, pending):
+    """菜单「发消息」时，图片、文件等非文字内容按原样复制给对方。"""
+    global active_conversation
+    sid = pending.get("sid")
+    page = pending.get("page") or 0
+    kind = message_kind(message)
+    if kind not in RELAY_CONTENT_TYPES or kind == "text":
+        bot.reply_to(message, "这一步需要文字、图片或文件。请重新发送，或点菜单里的「取消」。")
+        return True
+    if not get_conversation(sid):
+        clear_pending(user_id)
+        bot.reply_to(message, "用户不存在，内容没有发送。")
+        return True
+    if not check_owner_rate_limit():
+        bot.reply_to(message, "发送太频繁，请稍等后再发一次。")
+        return True
+    random_delay(1.0, 2.8)
+    try:
+        bot.copy_message(
+            chat_id=sid,
+            from_chat_id=message.chat.id,
+            message_id=message.message_id,
+        )
+    except Exception as e:
+        logger.warning("菜单发送媒体失败: %s", e)
+        bot.reply_to(message, f"❌ 发送失败：{e}\n可以再发一次，或点取消。")
+        return True
+    active_conversation = sid
+    upsert_conversation(sid)
+    log_message(sid, "to_stranger", kind, message_preview(message))
+    name = _conv_name(get_conversation(sid))
+    clear_pending(user_id)
+    bot.reply_to(message, f"✅ 已把{_kind_label(kind)}发给 {name} (ID: {sid})")
     show_user(pending.get("chat_id"), pending.get("msg_id"), sid, page, banner="✅ 已发送")
     return True
 
@@ -2385,8 +2424,56 @@ def callback_links(call):
 
 # ============================================================
 # 核心消息路由（多对话）
+# 文字以外的图片、文件、语音等也走这里，靠 copy_message 原样转发。
 # ============================================================
-@bot.message_handler(func=lambda m: True)
+RELAY_CONTENT_TYPES = [
+    "text", "photo", "document", "animation",
+    "video", "video_note", "voice", "audio", "sticker",
+]
+_KIND_LABELS = {
+    "photo": "图片",
+    "document": "文件",
+    "animation": "动图",
+    "video": "视频",
+    "video_note": "视频",
+    "voice": "语音",
+    "audio": "音频",
+    "sticker": "贴纸",
+}
+_media_group_seen = {}
+
+
+def message_kind(message):
+    if getattr(message, "text", None):
+        return "text"
+    return getattr(message, "content_type", None) or "text"
+
+
+def message_preview(message):
+    return (getattr(message, "text", None) or getattr(message, "caption", None) or "")[:500]
+
+
+def _kind_label(kind):
+    return _KIND_LABELS.get(kind, "内容")
+
+
+def should_announce_media_group(user_id, message):
+    """同一组相册只发一次来源提示，每张图仍然单独转发。"""
+    group_id = getattr(message, "media_group_id", None)
+    if not group_id:
+        return True
+    now = time.time()
+    stale = [key for key, ts in _media_group_seen.items() if now - ts > 120]
+    for key in stale:
+        _media_group_seen.pop(key, None)
+    key = (user_id, str(group_id))
+    if key in _media_group_seen:
+        return False
+    _media_group_seen[key] = now
+    return True
+
+
+@bot.message_handler(func=lambda m: True, content_types=RELAY_CONTENT_TYPES)
 def handle_all(message):
     global active_conversation
     user_id = message.from_user.id
@@ -2419,8 +2506,7 @@ def handle_all(message):
             with conversation_lock:
                 active_conversation = target_id
             upsert_conversation(target_id)
-            text = message.text or message.caption or ""
-            log_message(target_id, "to_stranger", "text", text[:500])
+            log_message(target_id, "to_stranger", message_kind(message), message_preview(message))
             logger.info("回复: owner -> %s", target_id)
         except Exception as e:
             logger.warning("回复转发失败: %s", e)
@@ -2455,24 +2541,25 @@ def handle_all(message):
             if not active_conversation:
                 active_conversation = sender_id
 
-        if MSG_HEADER:
-            header = MSG_HEADER.replace("{name}", sender_name)
-            if sender_username:
-                header = header.replace("{username}", sender_username)
+        announced = should_announce_media_group(sender_id, message)
+        if announced:
+            if MSG_HEADER:
+                header = MSG_HEADER.replace("{name}", sender_name)
+                if sender_username:
+                    header = header.replace("{username}", sender_username)
+                else:
+                    header = header.replace(" (@{username})", "").replace("@{username}", "")
+                header = header.replace("{id}", str(sender_id))
+                header = header.replace("{queue}", str(queue_pos))
+                header = header.replace("{total}", str(len(convos)))
             else:
-                header = header.replace(" (@{username})", "").replace("@{username}", "")
-            header = header.replace("{id}", str(sender_id))
-            header = header.replace("{queue}", str(queue_pos))
-            header = header.replace("{total}", str(len(convos)))
-        else:
-            header = f"📩 来自：{sender_name}"
-            if sender_username:
-                header += f" (@{sender_username})"
-            header += f"\nID: `{sender_id}`"
-            header += f"\n队列: #{queue_pos}/{len(convos)}  "
-            header += "⬅ 当前" if active_conversation == sender_id else ""
-
-        bot.send_message(OWNER_ID, header, parse_mode="Markdown")
+                header = f"📩 来自：{sender_name}"
+                if sender_username:
+                    header += f" (@{sender_username})"
+                header += f"\nID: `{sender_id}`"
+                header += f"\n队列: #{queue_pos}/{len(convos)}  "
+                header += "⬅ 当前" if active_conversation == sender_id else ""
+            bot.send_message(OWNER_ID, header, parse_mode="Markdown")
         random_delay(0.5, 1.8)
         forwarded = bot.copy_message(
             chat_id=OWNER_ID,
@@ -2481,15 +2568,11 @@ def handle_all(message):
         )
         with conversation_lock:
             forwarded_msg_map[forwarded.message_id] = sender_id
-
-        if MSG_FOOTER:
+        if announced and MSG_FOOTER:
             footer = MSG_FOOTER.replace("{name}", sender_name).replace("{id}", str(sender_id))
             bot.send_message(OWNER_ID, footer, parse_mode="Markdown")
 
-        text = message.text or message.caption or ""
-        log_message(sender_id, "from_stranger",
-                    "text" if message.text else message.content_type,
-                    text[:500],
+        log_message(sender_id, "from_stranger", message_kind(message), message_preview(message),
                     owner_msg_id=forwarded.message_id)
         logger.info("转发: %s (%s) -> owner, 队列 #%s", sender_name, sender_id, queue_pos)
         return
@@ -2506,8 +2589,7 @@ def handle_all(message):
                 from_chat_id=message.chat.id,
                 message_id=message.message_id,
             )
-            text = message.text or message.caption or ""
-            log_message(active_conversation, "to_stranger", "text", text[:500])
+            log_message(active_conversation, "to_stranger", message_kind(message), message_preview(message))
             conv = get_conversation(active_conversation)
             name = (conv["first_name"] if conv else "未知") or "未知"
             bot.reply_to(message,
