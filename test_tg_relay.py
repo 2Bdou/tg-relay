@@ -670,188 +670,317 @@ if _app_ok:
 print("\n📦 测试 9.6: 命令菜单")
 
 if _app_ok:
-    # 主菜单键盘：4 个分类按钮
-    kb_main = _tgapp.build_menu_keyboard(is_owner_user=True)
-    cats = [btn.callback_data for row in kb_main.keyboard for btn in row]
-    check("主菜单含对话分类", "menu_cat_dialog" in cats)
-    check("主菜单含封禁分类", "menu_cat_ban" in cats)
-    check("主菜单含链接分类", "menu_cat_link" in cats)
-    check("主菜单含系统分类", "menu_cat_sys" in cats)
+    _link_dir = tempfile.mkdtemp()
+    _tgapp.LINKS_FILE = os.path.join(_link_dir, "links.json")
 
-    # 子菜单键盘：命令按钮齐全
-    kb_dialog = _tgapp.build_menu_keyboard("dialog", is_owner_user=True)
-    cmd_data = [btn.callback_data for row in kb_dialog.keyboard for btn in row]
-    for expect in ["menu_exec_contacts", "menu_exec_chat", "menu_exec_queue",
-                   "menu_exec_who", "menu_exec_del", "menu_exec_note",
-                   "menu_exec_history", "menu_exec_export", "menu_exec_send"]:
-        check(f"对话子菜单含 {expect}", expect in cmd_data)
-    check("子菜单含返回键", "menu_cat_root" in cmd_data)
-
-    # 所有 callback_data ≤64
-    all_ok = True
-    for cat_key, _, _ in _tgapp.MENU_CATS:
-        kb = _tgapp.build_menu_keyboard(cat_key, is_owner_user=True)
+    def _cb_of(kb):
+        if kb is None:
+            return []
+        found = []
         for row in kb.keyboard:
-            for btn in row:
-                if len(btn.callback_data) > 64:
-                    all_ok = False
-                    print(f"    ❌ callback 超长: {btn.callback_data}")
-    check("菜单 callback_data 全部 ≤64", all_ok)
+            for button in row:
+                if button.callback_data:
+                    found.append(button.callback_data)
+        return found
 
-    # 渲染：主菜单与各分类
-    check("render_menu 主菜单", "TG Relay 命令菜单" in _tgapp.render_menu())
-    check("render_menu 对话分类", "对话卡片" in _tgapp.render_menu("dialog"))
-    check("render_menu 链接分类", "查看链接" in _tgapp.render_menu("link"))
+    def _kb_short(kb, label):
+        bad = [item for item in _cb_of(kb) if len(item.encode()) > 64]
+        check(label, not bad, str(bad))
+
+    kb_main = _tgapp.build_menu_keyboard(is_owner_user=True)
+    cats = _cb_of(kb_main)
+    check("主菜单含对话分类", "m|cat|dialog" in cats)
+    check("主菜单含封禁分类", "m|cat|ban" in cats)
+    check("主菜单含链接分类", "m|cat|link" in cats)
+    check("主菜单含系统分类", "m|cat|sys" in cats)
+
+    kb_dialog = _tgapp.build_menu_keyboard("dialog", is_owner_user=True)
+    dialog_data = _cb_of(kb_dialog)
+    for expect in ("m|people|0", "m|queue", "m|who", "m|home"):
+        check(f"对话子菜单含 {expect}", expect in dialog_data)
+    check("封禁子菜单含列表", "m|banned|0" in _cb_of(_tgapp.build_menu_keyboard("ban", True)))
+    link_owner = _cb_of(_tgapp.build_menu_keyboard("link", True))
+    for expect in ("m|links|-1|0", "m|links|-2|0", "m|find", "m|add", "m|lmgr|0"):
+        check(f"链接子菜单含 {expect}", expect in link_owner)
+    sys_owner = _cb_of(_tgapp.build_menu_keyboard("sys", True))
+    for expect in ("m|exec|stats", "m|exec|about", "m|exec|ping", "m|exec|id", "m|exec|help"):
+        check(f"系统子菜单含 {expect}", expect in sys_owner)
+
+    for cat_key, _label, _cmds in _tgapp.MENU_CATS:
+        _kb_short(_tgapp.build_menu_keyboard(cat_key, is_owner_user=True), f"{cat_key} 回调不超长")
+    _kb_short(kb_main, "主菜单回调不超长")
+    _kb_short(_tgapp.user_panel_keyboard(101, 0, False), "用户面板回调不超长")
+    _kb_short(_tgapp.linkadd_category_keyboard(), "添加链接类别键盘不超长")
+    _text, _kb = _tgapp.render_links_screen(-1, 0)
+    _kb_short(_kb, "链接浏览回调不超长")
+    _text, _kb = _tgapp.render_link_manager(0)
+    _kb_short(_kb, "链接管理回调不超长")
+    _text, _kb = _tgapp.render_link_detail(0, 0)
+    _kb_short(_kb, "链接详情回调不超长")
+
+    check("render_menu 主菜单", "TG Relay 菜单" in _tgapp.render_menu() and "取消" in _tgapp.render_menu())
+    check("render_menu 对话分类", "对话列表" in _tgapp.render_menu("dialog"))
+    check("render_menu 链接分类", "分步" in _tgapp.render_menu("link"))
     check("render_menu 系统分类", "统计面板" in _tgapp.render_menu("sys"))
+    check("render_menu 封禁分类", "解封" in _tgapp.render_menu("ban"))
 
-    # 陌生人菜单：只显示链接入口
     kb_stranger = _tgapp.build_menu_keyboard(is_owner_user=False)
-    stranger_data = [btn.callback_data for row in kb_stranger.keyboard for btn in row]
-    check("陌生人菜单无封禁", "menu_cat_ban" not in stranger_data)
-    check("陌生人菜单有链接", "menu_exec_links" in stranger_data)
+    stranger_data = _cb_of(kb_stranger)
+    check("陌生人菜单无封禁", "m|cat|ban" not in stranger_data)
+    check("陌生人菜单无对话", "m|cat|dialog" not in stranger_data)
+    check("陌生人菜单有链接", "m|cat|link" in stranger_data)
+    check("陌生人菜单有系统", "m|cat|sys" in stranger_data)
+    stranger_link = _cb_of(_tgapp.build_menu_keyboard("link", False))
+    check("陌生人不能添加链接", "m|add" not in stranger_link)
+    check("陌生人不能管理链接", "m|lmgr|0" not in stranger_link)
+    check("陌生人可搜索链接", "m|find" in stranger_link)
 
-    # callback 分发：无参命令执行（stub bot 防网络调用）
+    panel_data = _cb_of(_tgapp.user_panel_keyboard(101, 0, False))
+    for expect in (
+        "m|do|chat|101|0", "m|do|send|101|0", "m|do|note|101|0", "m|do|nclear|101|0",
+        "m|hist|101|0|0", "m|do|exp|101|0", "m|do|ban|101|0", "m|do|del|101|0",
+    ):
+        check(f"操作面板含 {expect}", expect in panel_data)
+
     _orig_reply = _tgapp.bot.reply_to
     _orig_answer = _tgapp.bot.answer_callback_query
     _orig_edit = _tgapp.bot.edit_message_text
     _orig_send = _tgapp.bot.send_message
+    _orig_copy = _tgapp.bot.copy_message
+    _orig_delay = _tgapp.random_delay
     _replies = []
     _answers = []
     _edits = []
+    _markups = []
+    _sent = []
+    _copied = []
+
     def _fake_reply(message, text, **kwargs):
         _replies.append(text)
+
     def _fake_answer(call_id, text=None, **kwargs):
         _answers.append(text)
+
     def _fake_edit(text, *a, **k):
         _edits.append(text)
+        _markups.append(k.get("reply_markup"))
+
+    def _fake_send(*a, **k):
+        _sent.append(a)
+
+    def _fake_copy(*a, **k):
+        _copied.append(a)
+        return type("Sent", (), {"message_id": 42})()
+
     _tgapp.bot.reply_to = _fake_reply
     _tgapp.bot.answer_callback_query = _fake_answer
     _tgapp.bot.edit_message_text = _fake_edit
-    _tgapp.bot.send_message = lambda *a, **k: None
+    _tgapp.bot.send_message = _fake_send
+    _tgapp.bot.copy_message = _fake_copy
+    _tgapp.random_delay = lambda *a, **k: None
 
     owner_id = int(os.environ.get("TG_OWNER_ID", "0"))
+
     class _FakeChat:
         id = 99999
-    class _FakeUser:
-        id = owner_id
-        username = "owner_test"
-        first_name = "Owner"
-    class _FakeCall:
-        id = "cb123"
-        data = ""
-        message = type("M", (), {"chat": _FakeChat(), "message_id": 1})()
-        from_user = _FakeUser()
 
-    # 点 /who
-    _FakeCall.data = "menu_exec_who"
+    class _User:
+        def __init__(self, uid, name, username):
+            self.id = uid
+            self.first_name = name
+            self.username = username
+
+    class _Msg:
+        def __init__(self, user, text):
+            self.from_user = user
+            self.chat = _FakeChat()
+            self.reply_to_message = None
+            self.text = text
+            self.caption = None
+            self.content_type = "text"
+            self.message_id = 55
+            self.date = int(time.time())
+
+    class _Call:
+        def __init__(self, user, data):
+            self.id = "cb123"
+            self.data = data
+            self.from_user = user
+            self.message = type("M", (), {"chat": _FakeChat(), "message_id": 1})()
+
+    owner = _User(owner_id, "Owner", "owner_test")
+    stranger = _User(555001, "Str", "stranger")
+
+    def click(user, data):
+        _tgapp.callback_menu(_Call(user, data))
+
+    def last_edit():
+        return _edits[-1] if _edits else ""
+
+    click(owner, "m|home")
+    check("打开主菜单", "TG Relay 菜单" in last_edit())
+    click(owner, "m|cat|dialog")
+    check("进入对话分类", "对话列表" in last_edit())
+    click(owner, "m|people|0")
+    check("对话列表含用户", "101" in last_edit(), last_edit()[:180])
+    click(owner, "m|user|101|0")
+    check("打开用户面板", "选择操作" in last_edit() and "User101" in last_edit(), last_edit()[:180])
+
+    click(owner, "m|do|chat|101|0")
+    check("菜单切换当前对话", _tgapp.active_conversation == 101)
+    check("切换后仍停在面板", "已切换" in last_edit())
+
+    click(owner, "m|queue")
+    check("队列可从菜单打开", "待回复队列" in last_edit())
+    click(owner, "m|who")
+    check("当前对象可从菜单打开", "User101" in last_edit() and "当前对话对象" in last_edit())
+
+    click(owner, "m|exec|stats")
+    check("统计在菜单内展示", "统计面板" in last_edit() and "总用户" in last_edit())
+    click(owner, "m|exec|ping")
+    check("延迟在菜单内展示", "Pong" in last_edit())
+    click(owner, "m|exec|help")
+    check("帮助在菜单内展示", "只用 /menu" in last_edit())
+
+    click(owner, "m|do|note|101|0")
+    check("备注进入输入", owner_id in _tgapp.pending_input and _tgapp.pending_input[owner_id]["flow"] == "note")
+    _tgapp.handle_all(_Msg(owner, "重要客户"))
+    noted = _tgapp.get_conversation(101)
+    check("备注已写入", noted is not None and noted["note"] == "重要客户", str(noted["note"] if noted else None))
+    check("备注输入已结束", owner_id not in _tgapp.pending_input)
+    click(owner, "m|do|nclear|101|0")
+    cleared = _tgapp.get_conversation(101)
+    check("菜单可清除备注", cleared is not None and not cleared["note"])
+
+    _tgapp.log_message(101, "from_stranger", "text", "历史内容甲", 0)
+    click(owner, "m|hist|101|0|0")
+    check("记录可翻页查看", "历史内容甲" in last_edit())
+    before_send = len(_sent)
+    click(owner, "m|do|exp|101|0")
+    check("导出从菜单发出", any("对话记录" in str(item) for item in _sent[before_send:]))
+    check("导出后回到面板", "导出内容已发到" in last_edit())
+
+    click(owner, "m|do|ban|101|0")
+    banned = _tgapp.get_conversation(101)
+    check("菜单封禁", banned is not None and banned["is_blocked"] == 1)
+    click(owner, "m|banned|0")
+    check("封禁列表含该用户", "101" in last_edit())
+    click(owner, "m|do|unban|101|0")
+    unbanned = _tgapp.get_conversation(101)
+    check("菜单解封", unbanned is not None and unbanned["is_blocked"] == 0)
+
+    click(owner, "m|do|send|102|0")
+    check("发消息进入输入", _tgapp.pending_input.get(owner_id, {}).get("flow") == "send")
+    before_send = len(_sent)
+    _tgapp.handle_all(_Msg(owner, "菜单发出的消息"))
+    check("菜单消息发给指定用户", any(len(item) >= 2 and item[0] == 102 and item[1] == "菜单发出的消息" for item in _sent[before_send:]))
+    check("发送后成为当前对象", _tgapp.active_conversation == 102)
+    check("发送输入已结束", owner_id not in _tgapp.pending_input)
+
+    click(owner, "m|do|del|102|0")
+    check("删除先确认", "确认删除" in last_edit())
+    click(owner, "m|do|delok|102|0")
+    check("确认后删除对话", _tgapp.get_conversation(102) is None)
+
+    click(owner, "m|add")
+    _tgapp.handle_all(_Msg(owner, "GitHub"))
+    check("重名链接不会进入下一步", _tgapp.pending_input.get(owner_id, {}).get("step") == "name")
+    _tgapp.handle_all(_Msg(owner, "MenuLink"))
+    check("添加进入网址步骤", _tgapp.pending_input.get(owner_id, {}).get("step") == "url")
+    _tgapp.handle_all(_Msg(owner, "not-a-url"))
+    check("非法网址停在当前步", _tgapp.pending_input.get(owner_id, {}).get("step") == "url")
+    _tgapp.handle_all(_Msg(owner, "https://menu.example/a"))
+    check("添加进入类别步骤", _tgapp.pending_input.get(owner_id, {}).get("step") == "cat")
+    _tgapp.handle_all(_Msg(owner, "菜单分类"))
+    added = [link for link in _tgapp.load_links() if link["name"] == "MenuLink"]
+    check("分步添加已保存", len(added) == 1 and added[0]["category"] == "菜单分类" and added[0]["url"] == "https://menu.example/a")
+    check("添加结束后退出输入", owner_id not in _tgapp.pending_input)
+
+    click(owner, "m|find")
+    _tgapp.handle_all(_Msg(owner, "git"))
+    check("搜索结果留在菜单", "GitHub" in last_edit() or "git" in last_edit().lower())
+    click(owner, "m|links|-2|0")
+    check("类别列表可点开", "选择类别" in last_edit())
+    cats_now = _tgapp.link_categories()
+    if cats_now:
+        click(owner, f"m|links|0|0")
+        check("点类别后看到链接", "条" in last_edit() or "链接" in last_edit())
+
+    idx = next(i for i, link in enumerate(_tgapp.load_links()) if link["name"] == "MenuLink")
+    click(owner, f"m|ledit|{idx}|n|0")
+    check("改名进入输入", _tgapp.pending_input.get(owner_id, {}).get("flow") == "linkedit")
+    _tgapp.handle_all(_Msg(owner, "MenuLink2"))
+    check("菜单改名成功", any(link["name"] == "MenuLink2" for link in _tgapp.load_links()))
+    idx = next(i for i, link in enumerate(_tgapp.load_links()) if link["name"] == "MenuLink2")
+    click(owner, f"m|ldel|{idx}|0")
+    check("删除链接先确认", "确认删除链接" in last_edit())
+    click(owner, f"m|ldelok|{idx}|0")
+    check("菜单删除链接", all(link["name"] != "MenuLink2" for link in _tgapp.load_links()))
+
+    click(owner, "m|do|note|101|0")
+    click(owner, "m|home")
+    check("点菜单会取消未完成输入", owner_id not in _tgapp.pending_input)
+
+    _tgapp.set_pending(owner_id, "note", sid=101, page=0, chat_id=99999, msg_id=1)
+    ping_msg = _Msg(owner, "/ping")
+    ping_hit = False
+    for handler in _tgapp.bot.message_handlers:
+        commands = (handler.get("filters") or {}).get("commands") or []
+        if "ping" in commands:
+            handler["function"](ping_msg)
+            ping_hit = True
+            break
+    check("斜杠命令会取消未完成输入", ping_hit and owner_id not in _tgapp.pending_input)
+
+    _tgapp.set_pending(owner_id, "note", sid=101, page=0, chat_id=99999, msg_id=1)
+    empty = _Msg(owner, "")
+    empty.text = None
+    _tgapp.handle_all(empty)
+    check("非文字不会结束输入", owner_id in _tgapp.pending_input)
+    check("非文字有提示", any("需要文字" in item for item in _replies[-2:]))
+
+    reply_msg = _Msg(owner, "这不是备注")
+    reply_msg.reply_to_message = type("R", (), {"message_id": 999999})()
+    note_before = (_tgapp.get_conversation(101) or {}).get("note")
+    _tgapp.handle_all(reply_msg)
+    note_after = (_tgapp.get_conversation(101) or {}).get("note")
+    check("回复转发时不把内容当成备注", note_before == note_after and owner_id not in _tgapp.pending_input)
+
+    click(stranger, "m|people|0")
+    check("陌生人打不开对话列表", "owner" in (_answers[-1] or ""))
+    click(stranger, "m|exec|ping")
+    check("陌生人可以测延迟", "Pong" in last_edit())
+    click(stranger, "m|cat|link")
+    check("陌生人可以进链接", "浏览" in last_edit() or "搜索" in last_edit())
+    copies_before = len(_copied)
+    sends_before = len(_sent)
+    click(stranger, "m|find")
+    _tgapp.handle_all(_Msg(stranger, "python"))
+    check("陌生人搜索不转发给 owner", len(_copied) == copies_before and len(_sent) == sends_before)
+    check("陌生人能看到搜索结果", "Python" in last_edit() or "python" in last_edit().lower())
+
+    legacy = _Call(owner, "menu_exec_ping")
+    _tgapp.callback_legacy_menu(legacy)
+    check("旧菜单按钮会刷新", "菜单已更新" in last_edit())
+
+    card_call = _Call(owner, "card_none")
     try:
-        _tgapp.callback_menu(_FakeCall)
-        check("menu_exec_who 触发回复", any("当前对话" in r or "没有活跃对话" in r for r in _replies), str(_replies[-1:]))
-    except Exception as e:
-        check("menu_exec_who 触发回复", False, str(e))
+        _tgapp.callback_card(card_call)
+        check("页码按钮不再报错", True)
+    except Exception as exc:
+        check("页码按钮不再报错", False, str(exc))
 
-    # 点 /del（点选式 → 弹对话选择列表，走 edit 分支）
-    _FakeCall.data = "menu_exec_del"
-    _tgapp.callback_menu(_FakeCall)
-    check("menu_exec_del 弹选择列表", any("请选择对象" in e for e in _edits), str(_edits[-1:]))
+    link_call = _Call(owner, "links_1_开发_文档")
+    _tgapp.callback_links(link_call)
+    check("带下划线的类别不会被拆开", "开发_文档" in last_edit())
 
-    # 点 /linkadd（输入式 → 提示直接发送内容）
-    _FakeCall.data = "menu_exec_linkadd"
-    _tgapp.callback_menu(_FakeCall)
-    check("menu_exec_linkadd 提示输入", any("添加链接" in e for e in _edits), str(_edits[-1:]))
-
-    # 点 /ping
-    _FakeCall.data = "menu_exec_ping"
-    _tgapp.callback_menu(_FakeCall)
-    check("menu_exec_ping 触发回复", any("Pong" in r for r in _replies), str(_replies[-1:]))
-
-    # 返回主菜单
-    _FakeCall.data = "menu_cat_root"
-    _tgapp.callback_menu(_FakeCall)
-    check("menu_cat_root 可返回", True)
-
-    # ===== 点选交互测试（pick_*） =====
-    # 造一个对话对象
-    _tgapp.upsert_conversation(200, "Bob", "bob_tg")
-    _tgapp.log_message(200, "from_stranger", "text", "你好Bob", 0)
-
-    # pick_do_chat_200 → 切换对话
-    _FakeCall.data = "pick_do_chat_200"
-    _tgapp.callback_pick(_FakeCall)
-    check("pick_do_chat 切换对话", _tgapp.active_conversation == 200)
-    check("pick_do_chat 有回复", any("当前对话" in e for e in _edits), str(_edits[-1:]))
-
-    # pick_do_history_200 → 显示历史
-    _FakeCall.data = "pick_do_history_200"
-    _tgapp.callback_pick(_FakeCall)
-    check("pick_do_history 显示记录", any("最近消息" in e for e in _edits), str(_edits[-1:]))
-
-    # pick_do_note_200 → 设置 pending，等用户输入
-    _FakeCall.data = "pick_do_note_200"
-    _tgapp.callback_pick(_FakeCall)
-    check("pick_do_note 设置 pending", owner_id in _tgapp.pending_input, str(_tgapp.pending_input.keys()))
-
-    # 模拟用户发消息消费 pending（note）
-    class _FakeMsg:
-        from_user = _FakeUser()
-        chat = _FakeChat()
-        reply_to_message = None
-        text = "重要客户"
-        content_type = "text"
-        message_id = 55
-        date = int(time.time())
-    _tgapp.handle_all(_FakeMsg)
-    bob_conv = _tgapp.get_conversation(200)
-    check("pending note 已消费", bob_conv is not None and bob_conv["note"] == "重要客户",
-          str(bob_conv.get("note") if bob_conv else None))
-    check("pending 已清空", owner_id not in _tgapp.pending_input)
-
-    # pick_do_del_200 → 弹确认
-    _FakeCall.data = "pick_do_del_200"
-    _tgapp.callback_pick(_FakeCall)
-    check("pick_do_del 弹确认", any("确认删除" in e for e in _edits), str(_edits[-1:]))
-    # pick_confirm_del_200 → 执行删除
-    _FakeCall.data = "pick_confirm_del_200"
-    _tgapp.callback_pick(_FakeCall)
-    check("pick_confirm_del 已删除", _tgapp.get_conversation(200) is None)
-
-    # linkdel 流程
-    links_before = len(_tgapp.load_links())
-    _FakeCall.data = "menu_exec_linkdel"
-    _tgapp.callback_menu(_FakeCall)
-    check("menu_exec_linkdel 弹链接列表", any("删除的链接" in e for e in _edits), str(_edits[-1:]))
-    _FakeCall.data = "pick_do_linkdel_0"
-    _tgapp.callback_pick(_FakeCall)
-    check("pick_do_linkdel 弹确认", any("确认删除链接" in e for e in _edits), str(_edits[-1:]))
-    _FakeCall.data = "pick_confirm_linkdel_0"
-    _tgapp.callback_pick(_FakeCall)
-    links_after = _tgapp.load_links()
-    check("pick_confirm_linkdel 已删链接", len(links_after) == links_before - 1,
-          f"before={links_before} after={len(links_after)}")
-
-    # linkcat 流程
-    _FakeCall.data = "menu_exec_linkcat"
-    _tgapp.callback_menu(_FakeCall)
-    check("menu_exec_linkcat 弹类别列表", any("选择类别" in e for e in _edits), str(_edits[-1:]))
-    cats = sorted({l["category"] for l in _tgapp.load_links()})
-    if cats:
-        _FakeCall.data = f"pick_do_linkcat_{cats[0]}"
-        _tgapp.callback_pick(_FakeCall)
-        check("pick_do_linkcat 显示链接", any("类别" in e for e in _edits), str(_edits[-1:]))
-
-    # linkadd 输入式 pending
-    _FakeCall.data = "menu_exec_linkadd"
-    _tgapp.callback_menu(_FakeCall)
-    check("linkadd 进入 pending", owner_id in _tgapp.pending_input)
-    _FakeMsg.text = "TestLink;https://test.example.com;测试"
-    _tgapp.handle_all(_FakeMsg)
-    check("linkadd 已添加", any(l["name"] == "TestLink" for l in _tgapp.load_links()))
-
-    # 恢复原始方法
     _tgapp.bot.reply_to = _orig_reply
     _tgapp.bot.answer_callback_query = _orig_answer
     _tgapp.bot.edit_message_text = _orig_edit
     _tgapp.bot.send_message = _orig_send
+    _tgapp.bot.copy_message = _orig_copy
+    _tgapp.random_delay = _orig_delay
+
 
 # ============================================================
 # 测试 9: 启动自检逻辑模拟
