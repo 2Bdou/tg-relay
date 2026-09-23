@@ -983,6 +983,113 @@ if _app_ok:
 
 
 # ============================================================
+# 测试 9.7: 图片等非文字也会转发
+# ============================================================
+print("\n📦 测试 9.7: 图片转发")
+
+if _app_ok:
+    relay_types = None
+    for _handler in _tgapp.bot.message_handlers:
+        _types = (_handler.get("filters") or {}).get("content_types") or []
+        if "photo" in _types and "text" in _types:
+            relay_types = _types
+            break
+    check("转发入口包含图片", relay_types is not None and "photo" in relay_types)
+    check("转发入口包含文件", relay_types is not None and "document" in relay_types)
+    check("转发入口仍包含文字", relay_types is not None and "text" in relay_types)
+
+    _orig_reply = _tgapp.bot.reply_to
+    _orig_send = _tgapp.bot.send_message
+    _orig_copy = _tgapp.bot.copy_message
+    _orig_edit = _tgapp.bot.edit_message_text
+    _orig_delay = _tgapp.random_delay
+    _sent = []
+    _copied = []
+    _replies = []
+
+    def _fake_send(*args, **kwargs):
+        _sent.append(args)
+
+    def _fake_copy(*args, **kwargs):
+        _copied.append(kwargs if kwargs else args)
+        return type("Copied", (), {"message_id": 8800 + len(_copied)})()
+
+    def _fake_reply(message, text, **kwargs):
+        _replies.append(text)
+
+    _tgapp.bot.send_message = _fake_send
+    _tgapp.bot.copy_message = _fake_copy
+    _tgapp.bot.reply_to = _fake_reply
+    _tgapp.bot.edit_message_text = lambda *a, **k: None
+    _tgapp.random_delay = lambda *a, **k: None
+    _tgapp._media_group_seen.clear()
+
+    class _Chat:
+        def __init__(self, cid):
+            self.id = cid
+
+    class _Person:
+        def __init__(self, uid, name):
+            self.id = uid
+            self.first_name = name
+            self.username = "picuser"
+
+    class _Photo:
+        def __init__(self, user, chat_id, mid, group=None, caption="看这张图"):
+            self.from_user = user
+            self.chat = _Chat(chat_id)
+            self.message_id = mid
+            self.date = int(time.time())
+            self.text = None
+            self.caption = caption
+            self.content_type = "photo"
+            self.media_group_id = group
+            self.reply_to_message = None
+
+    stranger = _Person(424242, "Pic")
+    _tgapp.handle_all(_Photo(stranger, 424242, 11, group="album-1"))
+    check("陌生人图片被复制给 owner", any(
+        (item.get("chat_id") if isinstance(item, dict) else None) == _tgapp.OWNER_ID
+        or (isinstance(item, tuple) and _tgapp.OWNER_ID in item)
+        for item in _copied
+    ), str(_copied))
+    check("图片来源提示只发一次的第一条", any("来自" in str(item) for item in _sent))
+    hist = _tgapp.get_history(424242, limit=5)
+    check("图片记入历史", any(m["content_type"] == "photo" and "看这张图" in (m["content"] or "") for m in hist), str(hist[:1]))
+    sends_after_first = len(_sent)
+    copies_after_first = len(_copied)
+    _tgapp.handle_all(_Photo(stranger, 424242, 12, group="album-1", caption="第二张"))
+    check("同一组相册继续转发图片", len(_copied) == copies_after_first + 1)
+    check("同一组相册不重复来源提示", len(_sent) == sends_after_first, str(_sent[sends_after_first:]))
+
+    owner = _Person(int(os.environ.get("TG_OWNER_ID", "0")), "Owner")
+    _tgapp.active_conversation = 424242
+    before = len(_copied)
+    _tgapp.handle_all(_Photo(owner, owner.id, 21, caption="回图"))
+    check("owner 图片转给当前对象", any(
+        (item.get("chat_id") if isinstance(item, dict) else None) == 424242
+        for item in _copied[before:]
+    ), str(_copied[before:]))
+    owner_hist = _tgapp.get_history(424242, limit=3)
+    check("owner 图片类型被记录", any(m["direction"] == "to_stranger" and m["content_type"] == "photo" for m in owner_hist))
+
+    _tgapp.set_pending(owner.id, "send", sid=424242, page=0, chat_id=owner.id, msg_id=1)
+    before = len(_copied)
+    _tgapp.handle_all(_Photo(owner, owner.id, 22, caption="菜单图"))
+    check("菜单发消息可以发图片", any(
+        (item.get("chat_id") if isinstance(item, dict) else None) == 424242
+        for item in _copied[before:]
+    ))
+    check("菜单图片发送后结束输入", owner.id not in _tgapp.pending_input)
+    check("菜单图片有成功提示", any("图片" in item for item in _replies[-2:]))
+
+    _tgapp.bot.reply_to = _orig_reply
+    _tgapp.bot.send_message = _orig_send
+    _tgapp.bot.copy_message = _orig_copy
+    _tgapp.bot.edit_message_text = _orig_edit
+    _tgapp.random_delay = _orig_delay
+
+# ============================================================
 # 测试 9: 启动自检逻辑模拟
 # ============================================================
 print("\n📦 测试 9: 启动自检逻辑")# 模拟缺少 TOKEN
