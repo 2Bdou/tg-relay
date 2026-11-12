@@ -9,6 +9,7 @@ TG 双向匿名中继机器人 v3.2.0
 """
 
 import os
+import re
 import sys
 import time
 import json
@@ -47,7 +48,32 @@ OWNER_RATE_LIMIT = int(os.getenv("TG_OWNER_RATE_LIMIT", "8"))
 MSG_HEADER = os.getenv("TG_MSG_HEADER", "")
 MSG_FOOTER = os.getenv("TG_MSG_FOOTER", "")
 ADMIN_TOKEN = os.getenv("TG_ADMIN_TOKEN", "")
-VERSION = "3.2.0"
+VERSION = "3.3.0"
+
+# ============================================================
+# 防骚扰 / 反机器人配置（可通过环境变量配置，也可在 /menu 动态调整）
+# ============================================================
+def _env_bool(key, default=True):
+    val = os.getenv(key)
+    if val is None or val.strip() == "":
+        return default
+    return val.strip().lower() not in ("0", "false", "off", "no")
+
+IGNORE_BOTS = _env_bool("TG_IGNORE_BOTS", True)          # 忽略所有 is_bot=True 的机器人账号
+PRIVATE_ONLY = _env_bool("TG_PRIVATE_ONLY", True)        # 仅响应私聊，忽略被拉入群组/频道的消息
+CAPTCHA_MODE = (os.getenv("TG_CAPTCHA_MODE", "math") or "math").strip().lower()  # math / button / off
+if CAPTCHA_MODE not in ("math", "button", "off"):
+    CAPTCHA_MODE = "math"
+CAPTCHA_MAX_FAILS = int(os.getenv("TG_CAPTCHA_MAX_FAILS", "3"))    # 验证连续失败多少次自动拉黑（0=不拉黑）
+CAPTCHA_TIMEOUT = int(os.getenv("TG_CAPTCHA_TIMEOUT", "300"))      # 验证码有效时间（秒）
+CAPTCHA_COOLDOWN = int(os.getenv("TG_CAPTCHA_COOLDOWN", "45"))     # 同一未验证用户重复触发提示的最小间隔（秒）
+AUTO_BAN_STRIKES = int(os.getenv("TG_AUTO_BAN_STRIKES", "3"))      # 触发限流多少次自动永久拉黑（0=关闭）
+BLOCK_FORWARDS = _env_bool("TG_BLOCK_FORWARDS", True)    # 拦截陌生人转发自频道/他人的广告消息
+BLOCK_LINKS = _env_bool("TG_BLOCK_LINKS", False)         # 是否完全禁止陌生人发送网址链接
+MAX_URLS = int(os.getenv("TG_MAX_URLS", "3"))            # 单条消息最大允许 URL 数量（超过即拦截，0=不限）
+BLOCK_KEYWORDS_ENV = os.getenv("TG_BLOCK_KEYWORDS", "")  # 初始敏感词（逗号/分号分隔）
+KEYWORD_AUTOBAN = _env_bool("TG_KEYWORD_AUTOBAN", False) # 命中敏感词是否立即自动封禁
+QUICK_BAN_BTN = _env_bool("TG_QUICK_BAN_BTN", True)      # 转发给主人的消息头是否附带「一键封禁」按钮
 
 # ============================================================
 # 日志
@@ -95,7 +121,8 @@ def init_db():
             note TEXT DEFAULT '',
             last_message_time INTEGER DEFAULT 0,
             message_count INTEGER DEFAULT 0,
-            is_blocked INTEGER DEFAULT 0
+            is_blocked INTEGER DEFAULT 0,
+            is_verified INTEGER DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -107,19 +134,146 @@ def init_db():
             timestamp INTEGER NOT NULL,
             FOREIGN KEY (stranger_id) REFERENCES conversations(stranger_id)
         );
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT DEFAULT ''
+        );
         CREATE INDEX IF NOT EXISTS idx_messages_stranger ON messages(stranger_id, timestamp);
     """)
+    # 平滑升级迁移：若旧版数据库缺少 is_verified 字段则自动添加，并将已有正常历史消息的老联系人标记为已验证
+    existing_cols = {
+        row[1] for row in conn.execute("PRAGMA table_info(conversations)").fetchall()
+    }
+    if "is_verified" not in existing_cols:
+        conn.execute("ALTER TABLE conversations ADD COLUMN is_verified INTEGER DEFAULT 0")
+        conn.execute("UPDATE conversations SET is_verified = 1 WHERE message_count > 0 AND is_blocked = 0")
     conn.commit()
     conn.close()
 
 init_db()
 
 # ============================================================
-# 速率限制（加强版）
+# 防骚扰配置持久化与统计状态
 # ============================================================
-rate_limit_data = {}      # stranger: user_id -> [timestamps]
-owner_rate_data = []      # owner: [timestamps]
+KEYWORDS_FILE = os.path.join(DATA_DIR, "keywords.json")
+DEFAULT_KEYWORDS = [
+    kw.strip()
+    for kw in re.split(r"[,;，；\n]+", BLOCK_KEYWORDS_ENV)
+    if kw.strip()
+]
 
+spam_stats = {
+    "bot_blocked": 0,       # 拦截 is_bot 账号次数
+    "group_blocked": 0,     # 拦截非私聊消息次数
+    "blacklist_dropped": 0, # 黑名单静默丢弃次数
+    "captcha_sent": 0,      # 发送人机验证次数
+    "captcha_passed": 0,    # 人机验证通过次数
+    "captcha_failed": 0,    # 人机验证答错次数
+    "rate_limited": 0,      # 触发频率限制次数
+    "auto_banned": 0,       # 刷屏/验证失败/敏感词自动拉黑人数
+    "forward_blocked": 0,   # 拦截外部转发广告次数
+    "link_blocked": 0,      # 拦截违规链接次数
+    "keyword_blocked": 0,   # 拦截敏感词消息次数
+}
+
+rate_limit_data = {}       # stranger: user_id -> [timestamps]
+rate_limit_strikes = {}    # stranger: user_id -> {"count": int, "ts": float}
+owner_rate_data = []       # owner: [timestamps]
+captcha_challenges = {}    # user_id -> {"question": str, "answer": str, "options": list, "fails": int, "ts": float, "last_sent": float}
+pending_captcha_msgs = {}  # user_id -> message (暂存首条消息，验证通过后自动补发)
+forward_warn_ts = {}       # user_id -> last_warn_timestamp
+
+def get_setting(key, default_val=""):
+    try:
+        conn = get_db()
+        row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+        conn.close()
+        if row is not None and row["value"] != "":
+            return row["value"]
+    except Exception:
+        pass
+    return str(default_val)
+
+def set_setting(key, value):
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO settings (key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (key, str(value)),
+    )
+    conn.commit()
+    conn.close()
+
+def get_bool_setting(key, default_bool=False):
+    val = get_setting(key, "1" if default_bool else "0")
+    return str(val).strip().lower() in ("1", "true", "on", "yes")
+
+def get_captcha_mode():
+    mode = get_setting("captcha_mode", CAPTCHA_MODE).strip().lower()
+    return mode if mode in ("math", "button", "off") else "math"
+
+def set_captcha_mode(mode):
+    if mode in ("math", "button", "off"):
+        set_setting("captcha_mode", mode)
+
+def load_keywords():
+    if os.path.exists(KEYWORDS_FILE):
+        try:
+            with open(KEYWORDS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    return [str(x).strip() for x in data if str(x).strip()]
+        except Exception:
+            logger.warning("加载 keywords.json 失败，使用默认敏感词")
+    return list(DEFAULT_KEYWORDS)
+
+def save_keywords(keywords):
+    cleaned = []
+    seen = set()
+    for kw in keywords:
+        k = str(kw or "").strip()
+        if k and k.lower() not in seen:
+            seen.add(k.lower())
+            cleaned.append(k)
+    with open(KEYWORDS_FILE, "w", encoding="utf-8") as f:
+        json.dump(cleaned, f, ensure_ascii=False, indent=2)
+    return cleaned
+
+def add_keywords(raw_text):
+    parts = [p.strip() for p in re.split(r"[,;，；\n]+", str(raw_text or "")) if p.strip()]
+    if not parts:
+        return 0, load_keywords()
+    current = load_keywords()
+    existing_lower = {k.lower() for k in current}
+    added = 0
+    for p in parts:
+        p_clean = p[:64]
+        if p_clean.lower() not in existing_lower:
+            current.append(p_clean)
+            existing_lower.add(p_clean.lower())
+            added += 1
+    save_keywords(current)
+    return added, current
+
+def delete_keyword(target):
+    current = load_keywords()
+    if isinstance(target, int) or (isinstance(target, str) and target.isdigit()):
+        idx = int(target) - 1 if isinstance(target, str) else target
+        if 0 <= idx < len(current):
+            removed = current.pop(idx)
+            save_keywords(current)
+            return True, removed
+    target_str = str(target or "").strip().lower()
+    for i, k in enumerate(current):
+        if k.lower() == target_str:
+            removed = current.pop(i)
+            save_keywords(current)
+            return True, removed
+    return False, ""
+
+# ============================================================
+# 速率限制与防刷屏自动封禁（加强版）
+# ============================================================
 def check_rate_limit(user_id):
     if RATE_LIMIT <= 0:
         return True
@@ -129,6 +283,20 @@ def check_rate_limit(user_id):
         rate_limit_data[user_id] = []
     rate_limit_data[user_id] = [t for t in rate_limit_data[user_id] if t > cutoff]
     if len(rate_limit_data[user_id]) >= RATE_LIMIT:
+        spam_stats["rate_limited"] += 1
+        # 记录违规次数，达到阈值自动拉黑
+        if AUTO_BAN_STRIKES > 0:
+            strike = rate_limit_strikes.get(user_id)
+            if not strike or now - strike["ts"] > 600:
+                strike = {"count": 0, "ts": now}
+            strike["count"] += 1
+            strike["ts"] = now
+            rate_limit_strikes[user_id] = strike
+            if strike["count"] >= AUTO_BAN_STRIKES:
+                block_user(user_id)
+                rate_limit_strikes.pop(user_id, None)
+                spam_stats["auto_banned"] += 1
+                logger.warning("用户触发高频刷屏自动封禁: %s (累计违规 %s 次)", user_id, strike["count"])
         return False
     rate_limit_data[user_id].append(now)
     return True
@@ -148,17 +316,59 @@ def check_owner_rate_limit():
 def random_delay(min_sec=0.8, max_sec=3.0):
     time.sleep(random.uniform(min_sec, max_sec))
 
-def block_user(stranger_id):
+def block_user(stranger_id, first_name="", username=""):
     conn = get_db()
-    conn.execute("UPDATE conversations SET is_blocked = 1 WHERE stranger_id = ?", (stranger_id,))
+    conn.execute("""
+        INSERT INTO conversations (stranger_id, first_name, username, last_message_time, is_blocked)
+        VALUES (?, ?, ?, ?, 1)
+        ON CONFLICT(stranger_id) DO UPDATE SET
+            first_name = COALESCE(NULLIF(?, ''), first_name),
+            username = COALESCE(NULLIF(?, ''), username),
+            is_blocked = 1
+    """, (stranger_id, first_name, username, int(time.time()), first_name, username))
     conn.commit()
     conn.close()
+    pending_captcha_msgs.pop(stranger_id, None)
+    captcha_challenges.pop(stranger_id, None)
 
 def unblock_user(stranger_id):
     conn = get_db()
     conn.execute("UPDATE conversations SET is_blocked = 0 WHERE stranger_id = ?", (stranger_id,))
     conn.commit()
     conn.close()
+    rate_limit_strikes.pop(stranger_id, None)
+
+def verify_user(stranger_id, first_name="", username=""):
+    conn = get_db()
+    conn.execute("""
+        INSERT INTO conversations (stranger_id, first_name, username, last_message_time, is_verified)
+        VALUES (?, ?, ?, ?, 1)
+        ON CONFLICT(stranger_id) DO UPDATE SET
+            first_name = COALESCE(NULLIF(?, ''), first_name),
+            username = COALESCE(NULLIF(?, ''), username),
+            is_verified = 1
+    """, (stranger_id, first_name, username, int(time.time()), first_name, username))
+    conn.commit()
+    conn.close()
+    captcha_challenges.pop(stranger_id, None)
+
+def unverify_user(stranger_id):
+    conn = get_db()
+    conn.execute("UPDATE conversations SET is_verified = 0 WHERE stranger_id = ?", (stranger_id,))
+    conn.commit()
+    conn.close()
+
+def is_user_verified(stranger_id):
+    if stranger_id == OWNER_ID:
+        return True
+    conv = get_conversation(stranger_id)
+    return bool(conv and conv.get("is_verified"))
+
+def is_user_blocked(stranger_id):
+    if stranger_id == OWNER_ID:
+        return False
+    conv = get_conversation(stranger_id)
+    return bool(conv and conv.get("is_blocked"))
 
 def get_blocked_users():
     conn = get_db()
@@ -290,6 +500,9 @@ def delete_conversation(stranger_id):
         stale = [k for k, v in forwarded_msg_map.items() if v == stranger_id]
         for k in stale:
             forwarded_msg_map.pop(k, None)
+    captcha_challenges.pop(stranger_id, None)
+    pending_captcha_msgs.pop(stranger_id, None)
+    rate_limit_strikes.pop(stranger_id, None)
 
 # ============================================================
 # 对话卡片面板（/contacts）
@@ -515,7 +728,8 @@ def find_links(keyword):
 # ============================================================
 @bot.message_handler(commands=["start", "help"])
 def handle_start(message):
-    if is_owner(message.from_user.id):
+    user_id = message.from_user.id
+    if is_owner(user_id):
         if WELCOME_OWNER:
             bot.reply_to(message, WELCOME_OWNER)
         else:
@@ -523,14 +737,17 @@ def handle_start(message):
                 "👋 你是 owner。陌生人的消息会转发到这里。\n"
                 "回复我转发的消息，就会回到那个人。\n"
                 "直接发消息，则发给当前对话对象。\n\n"
-                "/menu — 打开菜单：切换、回复、备注、记录、导出、封禁、链接都在里面")
+                "/menu — 打开菜单：切换、回复、备注、记录、导出、封禁、防骚扰、链接都在里面")
     else:
-        if WELCOME_STRANGER:
-            bot.reply_to(message, WELCOME_STRANGER)
+        welcome_text = WELCOME_STRANGER or (
+            "👋 你好！你的消息会匿名转发给 bot 主人。\n"
+            "/menu — 查看链接、测延迟、获取自己的 ID"
+        )
+        # 若开启了人机验证且该访客尚未验证，在欢迎同时弹出验证面板
+        if get_captcha_mode() != "off" and not is_user_verified(user_id):
+            send_captcha_challenge(message, prefix_text=welcome_text + "\n\n")
         else:
-            bot.reply_to(message,
-                "👋 你好！你的消息会匿名转发给 bot 主人。\n"
-                "/menu — 查看链接、测延迟、获取自己的 ID")
+            bot.reply_to(message, welcome_text)
 
 @bot.message_handler(commands=["ping"])
 def handle_ping(message):
@@ -686,8 +903,11 @@ last_link_query = {}
 PENDING_TIMEOUT = 300
 PEOPLE_PER_PAGE = 5
 
-OWNER_ONLY_CATS = {"dialog", "ban"}
-OWNER_ONLY_ITEMS = {"people", "queue", "who", "banned", "add", "manage", "stats"}
+OWNER_ONLY_CATS = {"dialog", "ban", "antispam"}
+OWNER_ONLY_ITEMS = {
+    "people", "queue", "who", "banned", "add", "manage", "stats",
+    "as_panel", "as_kw", "as_kwadd",
+}
 
 MENU_CATS = [
     ("dialog", "💬 对话", [
@@ -697,6 +917,11 @@ MENU_CATS = [
     ]),
     ("ban", "🚫 封禁", [
         ("banned", "📃 封禁列表"),
+    ]),
+    ("antispam", "🛡️ 防骚扰", [
+        ("as_panel", "🛡️ 防骚扰控制台"),
+        ("as_kw", "🔤 敏感词黑名单"),
+        ("as_kwadd", "➕ 添加敏感词"),
     ]),
     ("link", "🔗 链接", [
         ("browse", "🔗 浏览全部"),
@@ -719,6 +944,9 @@ CMD_CB = {
     "queue": "m|queue",
     "who": "m|who",
     "banned": "m|banned|0",
+    "as_panel": "m|as|panel",
+    "as_kw": "m|as|kw|0",
+    "as_kwadd": "m|as|kwadd",
     "browse": "m|links|-1|0",
     "cats": "m|links|-2|0",
     "find": "m|find",
@@ -734,6 +962,7 @@ CMD_CB = {
 MENU_CAT_HELP = {
     "dialog": "点开一个人，就可以切换当前对话、发消息、改备注、看记录、导出、封禁或删除。",
     "ban": "这里只列出已封禁的人。点进去可以解封；要封禁，从对话列表进入对方的操作面板。",
+    "antispam": "管理人机验证（算术题/按钮/关闭）、外部转发拦截、链接过滤与敏感词黑名单，阻止机器人骚扰。",
     "link": "浏览、按类别查看和搜索都可以直接点。添加和修改是分步完成的，不用再记分号格式。",
     "sys": "统计、关于、延迟、你的 ID 和帮助。",
 }
@@ -917,6 +1146,15 @@ def render_stats_text():
     top_text = ""
     for i, c in enumerate(top_users, 1):
         top_text += f"  {i}. {_clean(c['first_name'] or '未知', 24)} ({c['message_count']}条)\n"
+    total_intercepted = (
+        spam_stats["bot_blocked"]
+        + spam_stats["group_blocked"]
+        + spam_stats["blacklist_dropped"]
+        + spam_stats["rate_limited"]
+        + spam_stats["forward_blocked"]
+        + spam_stats["link_blocked"]
+        + spam_stats["keyword_blocked"]
+    )
     return (
         f"📊 统计面板\n\n"
         f"总用户: {stats['total_users']}\n"
@@ -924,6 +1162,8 @@ def render_stats_text():
         f"今日消息: {stats['today_messages']}\n"
         f"活跃对话: {len(convos)}\n"
         f"速率限制: {'关闭' if RATE_LIMIT <= 0 else f'{RATE_LIMIT}条/{RATE_WINDOW}s'}\n"
+        f"人机验证: {get_captcha_mode()} (通过 {spam_stats['captcha_passed']} / 失败 {spam_stats['captcha_failed']})\n"
+        f"累计拦截骚扰: {total_intercepted} 次 (自动拉黑 {spam_stats['auto_banned']} 人)\n"
         f"\nTop 5 活跃用户:\n{top_text or '  (暂无)'}"
     )
 
@@ -1033,13 +1273,14 @@ def render_user_panel(sid):
     username = f" @{_clean(conv.get('username'), 32)}" if conv.get("username") else ""
     note = f"\n🏷 备注：{_clean(conv.get('note'), 80)}" if conv.get("note") else "\n🏷 备注：无"
     state = "\n🔒 状态：已封禁" if conv.get("is_blocked") else "\n🟢 状态：正常"
+    v_state = " ｜ 🛡️ 已验证" if conv.get("is_verified") else " ｜ ⏳ 未验证"
     active = "\n⬅ 这是当前对话对象" if sid == active_conversation else ""
     last = format_relative_time(conv.get("last_message_time"))
     return (
         f"👤 {name}{username}\n"
         f"🆔 {sid}\n"
         f"⏱ 最近：{last} ｜ 💬 {conv['message_count']} 条"
-        f"{note}{state}{active}\n\n"
+        f"{note}{state}{v_state}{active}\n\n"
         "选择操作："
     )
 
@@ -1047,11 +1288,16 @@ def render_user_panel(sid):
 def user_panel_keyboard(sid, page, blocked):
     ban_label = "✅ 解封" if blocked else "🚫 封禁"
     ban_act = "unban" if blocked else "ban"
+    conv = get_conversation(sid)
+    verified = bool(conv and conv.get("is_verified"))
+    ver_label = "🔄 重置人机验证" if verified else "✅ 免检放行(设为已验证)"
+    ver_act = "unverify" if verified else "verify"
     return kb_rows([
         [btn("💬 设为当前", f"m|do|chat|{sid}|{page}"), btn("✉️ 发消息", f"m|do|send|{sid}|{page}")],
         [btn("🏷 备注", f"m|do|note|{sid}|{page}"), btn("🧹 清除备注", f"m|do|nclear|{sid}|{page}")],
         [btn("📜 记录", f"m|hist|{sid}|0|{page}"), btn("📤 导出", f"m|do|exp|{sid}|{page}")],
         [btn(ban_label, f"m|do|{ban_act}|{sid}|{page}"), btn("🗑 删除", f"m|do|del|{sid}|{page}")],
+        [btn(ver_label, f"m|do|{ver_act}|{sid}|{page}")],
         back_home(f"m|people|{page}"),
     ])
 
@@ -1487,6 +1733,9 @@ def _menu_dispatch(call):
     if screen == "ldelok":
         _menu_ldelok(call, parts, chat_id, msg_id)
         return
+    if screen == "as":
+        _menu_antispam(call, parts, user_id, chat_id, msg_id)
+        return
     if screen == "exec":
         _menu_exec(call, parts, owner, chat_id, msg_id)
         return
@@ -1696,6 +1945,18 @@ def _menu_do(call, parts, chat_id, msg_id, user_id):
         show_user(chat_id, msg_id, sid, page, banner=f"✅ 已解封 {name}")
         _ack(call, f"✅ 已解封: {name}")
         return
+    if act == "verify":
+        verify_user(sid)
+        logger.info("菜单手动验证用户: %s (%s)", sid, name)
+        show_user(chat_id, msg_id, sid, page, banner=f"✅ 已将 {name} 设为免检已验证")
+        _ack(call, "✅ 已设为已验证")
+        return
+    if act == "unverify":
+        unverify_user(sid)
+        logger.info("菜单重置用户验证状态: %s (%s)", sid, name)
+        show_user(chat_id, msg_id, sid, page, banner=f"🔄 已重置 {name} 的人机验证状态")
+        _ack(call, "🔄 已重置验证")
+        return
     if act == "del":
         keyboard = kb_rows([
             [btn("✅ 确认删除", f"m|do|delok|{sid}|{page}")],
@@ -1764,6 +2025,8 @@ def consume_menu_input(message):
         return _consume_linkadd(message, user_id, pending, text)
     if flow == "linkedit":
         return _consume_linkedit(message, user_id, pending, text)
+    if flow == "kwadd":
+        return _consume_kwadd(message, user_id, pending, text)
     clear_pending(user_id)
     bot.reply_to(message, "上一步已失效。请重新打开 /menu。这条消息没有转发。")
     return True
@@ -1807,6 +2070,7 @@ def _consume_send(message, user_id, pending, text):
         return True
     active_conversation = sid
     upsert_conversation(sid)
+    verify_user(sid)
     log_message(sid, "to_stranger", "text", text[:500])
     conv = get_conversation(sid)
     name = _conv_name(conv)
@@ -1845,6 +2109,7 @@ def _consume_send_media(message, user_id, pending):
         return True
     active_conversation = sid
     upsert_conversation(sid)
+    verify_user(sid)
     log_message(sid, "to_stranger", kind, message_preview(message))
     name = _conv_name(get_conversation(sid))
     clear_pending(user_id)
@@ -1943,6 +2208,191 @@ def _consume_linkedit(message, user_id, pending, text):
     rendered = render_link_detail(idx, page)
     if rendered:
         show_screen(pending.get("chat_id"), pending.get("msg_id"), "✅ 已更新。\n\n" + rendered[0], rendered[1])
+    return True
+
+
+# ============================================================
+# 防骚扰控制台与敏感词管理菜单（/menu -> 🛡️ 防骚扰 & /antispam）
+# ============================================================
+_CAPTCHA_LABELS = {
+    "math": "🧮 算术题验证 (推荐)",
+    "button": "🔘 一键按钮验证",
+    "off": "⚪ 关闭验证",
+}
+_CAPTCHA_NEXT = {"math": "button", "button": "off", "off": "math"}
+
+
+def render_antispam_panel():
+    mode = get_captcha_mode()
+    ignore_bots = get_bool_setting("ignore_bots", IGNORE_BOTS)
+    priv_only = get_bool_setting("private_only", PRIVATE_ONLY)
+    blk_fwd = get_bool_setting("block_forwards", BLOCK_FORWARDS)
+    blk_link = get_bool_setting("block_links", BLOCK_LINKS)
+    kw_ban = get_bool_setting("keyword_autoban", KEYWORD_AUTOBAN)
+    qban = get_bool_setting("quick_ban_btn", QUICK_BAN_BTN)
+    kws = load_keywords()
+
+    text = (
+        "🛡️ 防骚扰与反机器人控制台\n\n"
+        f"• 拦截 Bot 账号：{'🟢 开启' if ignore_bots else '⚪ 关闭'}\n"
+        f"• 仅响应私聊：{'🟢 开启' if priv_only else '⚪ 关闭'}\n"
+        f"• 新人验证模式：{_CAPTCHA_LABELS.get(mode, mode)}\n"
+        f"  （连续答错 {CAPTCHA_MAX_FAILS} 次自动拉黑，验证通过后自动补发首条消息）\n"
+        f"• 拦截外部转发广告：{'🟢 开启' if blk_fwd else '⚪ 关闭'}\n"
+        f"• 禁止发送网址链接：{'🟢 开启' if blk_link else f'⚪ 关闭 (单条限 {MAX_URLS} 个)'}\n"
+        f"• 敏感词黑名单：共 {len(kws)} 个词（命中{'自动封禁' if kw_ban else '静默拦截'}）\n"
+        f"• 刷屏限流：{RATE_LIMIT}条/{RATE_WINDOW}秒（超限 {AUTO_BAN_STRIKES} 次自动封禁）\n"
+        f"• 转发消息头快捷封禁按钮：{'🟢 开启' if qban else '⚪ 关闭'}\n\n"
+        "📊 累计防御统计：\n"
+        f"  Bot 拦截 {spam_stats['bot_blocked']} ｜ 非私聊拦截 {spam_stats['group_blocked']}\n"
+        f"  验证通过 {spam_stats['captcha_passed']} ｜ 验证失败 {spam_stats['captcha_failed']}\n"
+        f"  转发拦截 {spam_stats['forward_blocked']} ｜ 链接拦截 {spam_stats['link_blocked']}\n"
+        f"  敏感词拦截 {spam_stats['keyword_blocked']} ｜ 限流拦截 {spam_stats['rate_limited']}\n"
+        f"  自动永久拉黑 {spam_stats['auto_banned']} 人"
+    )
+    kb = kb_rows([
+        [btn(f"🧩 验证: {_CAPTCHA_LABELS.get(mode, mode)}", "m|as|tog|cap")],
+        [
+            btn(f"📢 禁转发: {'开' if blk_fwd else '关'}", "m|as|tog|fwd"),
+            btn(f"🔗 禁链接: {'开' if blk_link else '关'}", "m|as|tog|lnk"),
+        ],
+        [
+            btn(f"🤖 拦Bot: {'开' if ignore_bots else '关'}", "m|as|tog|bot"),
+            btn(f"💬 仅私聊: {'开' if priv_only else '关'}", "m|as|tog|prv"),
+        ],
+        [
+            btn(f"⚡ 词封禁: {'开' if kw_ban else '关'}", "m|as|tog|kban"),
+            btn(f"🚫 快捷封禁钮: {'开' if qban else '关'}", "m|as|tog|qban"),
+        ],
+        [btn(f"🔤 敏感词管理 ({len(kws)})", "m|as|kw|0"), btn("➕ 添加敏感词", "m|as|kwadd")],
+        back_home("m|cat|antispam"),
+    ])
+    return text, kb
+
+
+def render_keywords_screen(page=0):
+    kws = load_keywords()
+    items, page, total_pages, start = _page_slice(kws, page, 8)
+    if not kws:
+        text = (
+            "🔤 敏感词黑名单（当前为空）\n\n"
+            "添加敏感词后，包含这些词的陌生人消息会被自动静默拦截（或自动封禁）。"
+        )
+    else:
+        lines = [
+            f"🔤 敏感词黑名单（共 {len(kws)} 个）",
+            "点击下方任意词即可删除：",
+            "",
+        ]
+        for i, kw in enumerate(items, start + 1):
+            lines.append(f"{i}. {_clean(kw, 40)}")
+        text = "\n".join(lines)
+
+    rows = []
+    row = []
+    for i, kw in enumerate(items):
+        idx = start + i
+        row.append(btn(f"🗑 {_clean(kw, 18)}", f"m|as|kwdel|{idx}|{page}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append(nav_row(page, total_pages, lambda p: f"m|as|kw|{p}"))
+    act_row = [btn("➕ 添加敏感词", "m|as|kwadd")]
+    if kws:
+        act_row.append(btn("🧹 清空全部", "m|as|kwclr"))
+    rows.append(act_row)
+    rows.append(back_home("m|as|panel"))
+    return text, kb_rows(rows)
+
+
+def _menu_antispam(call, parts, user_id, chat_id, msg_id):
+    sub = parts[2] if len(parts) > 2 else "panel"
+    if sub == "panel":
+        text, kb = render_antispam_panel()
+        show_screen(chat_id, msg_id, text, kb)
+        _ack(call)
+        return
+    if sub == "tog":
+        target = parts[3] if len(parts) > 3 else ""
+        if target == "cap":
+            cur = get_captcha_mode()
+            nxt = _CAPTCHA_NEXT.get(cur, "math")
+            set_captcha_mode(nxt)
+            _ack(call, f"验证模式已切换为: {_CAPTCHA_LABELS.get(nxt, nxt)}")
+        elif target == "fwd":
+            cur = get_bool_setting("block_forwards", BLOCK_FORWARDS)
+            set_setting("block_forwards", "0" if cur else "1")
+            _ack(call, f"拦截外部转发: {'已关闭' if cur else '已开启'}")
+        elif target == "lnk":
+            cur = get_bool_setting("block_links", BLOCK_LINKS)
+            set_setting("block_links", "0" if cur else "1")
+            _ack(call, f"禁止发送链接: {'已关闭' if cur else '已开启'}")
+        elif target == "bot":
+            cur = get_bool_setting("ignore_bots", IGNORE_BOTS)
+            set_setting("ignore_bots", "0" if cur else "1")
+            _ack(call, f"拦截 Bot 账号: {'已关闭' if cur else '已开启'}")
+        elif target == "prv":
+            cur = get_bool_setting("private_only", PRIVATE_ONLY)
+            set_setting("private_only", "0" if cur else "1")
+            _ack(call, f"仅响应私聊: {'已关闭' if cur else '已开启'}")
+        elif target == "kban":
+            cur = get_bool_setting("keyword_autoban", KEYWORD_AUTOBAN)
+            set_setting("keyword_autoban", "0" if cur else "1")
+            _ack(call, f"命中敏感词自动封禁: {'已关闭' if cur else '已开启'}")
+        elif target == "qban":
+            cur = get_bool_setting("quick_ban_btn", QUICK_BAN_BTN)
+            set_setting("quick_ban_btn", "0" if cur else "1")
+            _ack(call, f"转发头快捷封禁按钮: {'已关闭' if cur else '已开启'}")
+        else:
+            _ack(call, "未知开关")
+            return
+        text, kb = render_antispam_panel()
+        show_screen(chat_id, msg_id, text, kb)
+        return
+    if sub == "kw":
+        page = _arg_int(parts, 3, 0) or 0
+        text, kb = render_keywords_screen(page)
+        show_screen(chat_id, msg_id, text, kb)
+        _ack(call)
+        return
+    if sub == "kwadd":
+        set_pending(user_id, "kwadd", chat_id=chat_id, msg_id=msg_id)
+        show_screen(
+            chat_id, msg_id,
+            "➕ 添加敏感词\n\n请直接发送要屏蔽的关键词（支持一次发送多个，用逗号、分号或换行分隔）。",
+            cancel_kb("m|as|kw|0"),
+        )
+        _ack(call, "请发送敏感词")
+        return
+    if sub == "kwdel":
+        idx = _arg_int(parts, 3, -1)
+        page = _arg_int(parts, 4, 0) or 0
+        ok, removed = delete_keyword(idx if idx is not None else -1)
+        text, kb = render_keywords_screen(page)
+        banner = f"✅ 已删除敏感词：{removed}\n\n" if ok else ""
+        show_screen(chat_id, msg_id, banner + text, kb)
+        _ack(call, f"已删除: {removed}" if ok else "敏感词不存在")
+        return
+    if sub == "kwclr":
+        save_keywords([])
+        text, kb = render_keywords_screen(0)
+        show_screen(chat_id, msg_id, "🧹 已清空全部敏感词。\n\n" + text, kb)
+        _ack(call, "已清空敏感词")
+        return
+    _ack(call, "未知操作")
+
+
+def _consume_kwadd(message, user_id, pending, text):
+    added, total_list = add_keywords(text)
+    chat_id = pending.get("chat_id")
+    msg_id = pending.get("msg_id")
+    clear_pending(user_id)
+    reply_msg = f"✅ 成功添加 {added} 个敏感词（当前共 {len(total_list)} 个）。"
+    bot.reply_to(message, reply_msg)
+    screen_text, kb = render_keywords_screen(0)
+    show_screen(chat_id, msg_id, reply_msg + "\n\n" + screen_text, kb)
     return True
 
 @bot.message_handler(commands=["note"])
@@ -2052,6 +2502,68 @@ def handle_banlist(message):
         result += f"  • {name}{username} (ID: {b['stranger_id']})\n"
     bot.reply_to(message, result)
 
+@bot.message_handler(commands=["antispam"])
+def handle_antispam(message):
+    if not is_owner(message.from_user.id):
+        return
+    clear_pending(message.from_user.id)
+    text, kb = render_antispam_panel()
+    bot.reply_to(message, text, reply_markup=kb)
+
+@bot.message_handler(commands=["verify"])
+def handle_verify(message):
+    if not is_owner(message.from_user.id):
+        return
+    parts = message.text.split(" ", 1)
+    if len(parts) < 2:
+        bot.reply_to(message, "⚠️ 用法：/verify <user_id>\n将该用户直接设为已通过人机验证（免检白名单）")
+        return
+    try:
+        sid = int(parts[1].strip())
+    except ValueError:
+        bot.reply_to(message, "❌ 无效的用户 ID")
+        return
+    verify_user(sid)
+    bot.reply_to(message, f"✅ 用户 {sid} 已设为免检已验证状态。")
+
+@bot.message_handler(commands=["kwlist"])
+def handle_kwlist(message):
+    if not is_owner(message.from_user.id):
+        return
+    kws = load_keywords()
+    if not kws:
+        bot.reply_to(message, "📭 当前未设置敏感词。可用 /kwadd <词1,词2> 添加，或在 /menu -> 🛡️ 防骚扰 中管理。")
+        return
+    lines = [f"🔤 敏感词列表（共 {len(kws)} 个）："]
+    for i, kw in enumerate(kws, 1):
+        lines.append(f"  {i}. {kw}")
+    bot.reply_to(message, "\n".join(lines))
+
+@bot.message_handler(commands=["kwadd"])
+def handle_kwadd(message):
+    if not is_owner(message.from_user.id):
+        return
+    parts = message.text.split(" ", 1)
+    if len(parts) < 2 or not parts[1].strip():
+        bot.reply_to(message, "⚠️ 用法：/kwadd <关键词1,关键词2...>\n支持用逗号或分号分隔多个词")
+        return
+    added, kws = add_keywords(parts[1])
+    bot.reply_to(message, f"✅ 已添加 {added} 个敏感词（当前共 {len(kws)} 个）")
+
+@bot.message_handler(commands=["kwdel"])
+def handle_kwdel(message):
+    if not is_owner(message.from_user.id):
+        return
+    parts = message.text.split(" ", 1)
+    if len(parts) < 2 or not parts[1].strip():
+        bot.reply_to(message, "⚠️ 用法：/kwdel <序号或关键词>")
+        return
+    ok, removed = delete_keyword(parts[1].strip())
+    if ok:
+        bot.reply_to(message, f"✅ 已删除敏感词：{removed}")
+    else:
+        bot.reply_to(message, "❌ 未找到该敏感词")
+
 @bot.message_handler(commands=["del"])
 def handle_del(message):
     if not is_owner(message.from_user.id):
@@ -2115,6 +2627,7 @@ def handle_send(message):
     try:
         bot.send_message(sid, text)
         upsert_conversation(sid)
+        verify_user(sid)
         log_message(sid, "to_stranger", "text", text[:500])
         bot.reply_to(message, f"✅ 已发送给 ID: {sid}")
     except Exception as e:
@@ -2473,10 +2986,406 @@ def should_announce_media_group(user_id, message):
     return True
 
 
+# ============================================================
+# 防骚扰核心拦截器：源头检查、人机验证(CAPTCHA)、内容过滤、快捷拉黑
+# ============================================================
+_URL_RE = re.compile(r"(https?://\S+|t\.me/\S+|tg://\S+)", re.IGNORECASE)
+
+
+def should_drop_by_source(message):
+    """检查是否为 Bot 账号或非私聊消息（第 1 层防护）"""
+    user = getattr(message, "from_user", None)
+    if user is None:
+        return True
+    if is_owner(user.id):
+        return False
+    if get_bool_setting("ignore_bots", IGNORE_BOTS) and getattr(user, "is_bot", False):
+        spam_stats["bot_blocked"] += 1
+        logger.info("拦截 Bot 账号消息: %s (%s)", getattr(user, "username", ""), user.id)
+        return True
+    chat = getattr(message, "chat", None)
+    chat_type = getattr(chat, "type", "private") or "private"
+    if get_bool_setting("private_only", PRIVATE_ONLY) and chat_type != "private":
+        spam_stats["group_blocked"] += 1
+        logger.info("忽略非私聊消息: chat_type=%s, user=%s", chat_type, user.id)
+        return True
+    return False
+
+
+def _generate_captcha(user_id):
+    mode = get_captcha_mode()
+    now = time.time()
+    existing = captcha_challenges.get(user_id)
+    fails = existing["fails"] if existing else 0
+    if mode == "button":
+        question = "请点击下方按钮完成真人验证"
+        answer = "ok"
+        options = ["ok"]
+    else:
+        a = random.randint(2, 15)
+        b = random.randint(2, 15)
+        if random.random() < 0.5:
+            question = f"{a} + {b} = ?"
+            ans_num = a + b
+        else:
+            if a < b:
+                a, b = b, a
+            question = f"{a} - {b} = ?"
+            ans_num = a - b
+        answer = str(ans_num)
+        wrong = set()
+        while len(wrong) < 3:
+            cand = ans_num + random.choice([-5, -4, -3, -2, -1, 1, 2, 3, 4, 5, 6])
+            if cand >= 0 and cand != ans_num:
+                wrong.add(str(cand))
+        options = [answer] + list(wrong)
+        random.shuffle(options)
+
+    challenge = {
+        "mode": mode,
+        "question": question,
+        "answer": answer,
+        "options": options,
+        "fails": fails,
+        "ts": now,
+        "last_sent": existing.get("last_sent", 0) if existing else 0,
+    }
+    captcha_challenges[user_id] = challenge
+    return challenge
+
+
+def _build_captcha_keyboard(user_id, challenge):
+    if challenge["mode"] == "button":
+        return kb_rows([[btn("🤖 我是真人，点击验证", f"cap|{user_id}|ok")]])
+    btns = [btn(opt, f"cap|{user_id}|{opt}") for opt in challenge["options"]]
+    return kb_rows([btns[:2], btns[2:]])
+
+
+def _render_captcha_text(challenge, prefix_text="", retry_msg=""):
+    head = prefix_text if prefix_text else ""
+    warn = f"⚠️ {retry_msg}\n\n" if retry_msg else ""
+    if challenge["mode"] == "button":
+        return (
+            f"{head}{warn}🛡️ **人机安全验证**\n"
+            "为防止机器人广告骚扰，首次联系请点击下方按钮完成验证。\n"
+            "验证通过后，您的消息会自动转达给主人。"
+        )
+    return (
+        f"{head}{warn}🛡️ **人机安全验证**\n"
+        f"为防止群发机器人骚扰，请计算并点击正确答案：\n\n"
+        f"👉  `{challenge['question']}`\n\n"
+        "验证通过后，您刚才发送的消息将自动转达给主人。"
+    )
+
+
+def send_captcha_challenge(message, prefix_text=""):
+    user = message.from_user
+    user_id = user.id
+    now = time.time()
+    challenge = captcha_challenges.get(user_id)
+    # 冷却期内不重复回复验证码，避免被脚本刷爆 Telegram API 限额
+    if challenge and (now - challenge.get("last_sent", 0) < CAPTCHA_COOLDOWN) and not prefix_text:
+        return
+    if not challenge or (now - challenge.get("ts", 0) > CAPTCHA_TIMEOUT):
+        challenge = _generate_captcha(user_id)
+    challenge["last_sent"] = now
+    spam_stats["captcha_sent"] += 1
+    kb = _build_captcha_keyboard(user_id, challenge)
+    text = _render_captcha_text(challenge, prefix_text=prefix_text)
+    try:
+        bot.reply_to(message, text, reply_markup=kb)
+    except Exception as e:
+        logger.warning("发送验证码失败: %s", e)
+
+
+@bot.callback_query_handler(func=lambda call: (call.data or "").startswith("cap|"))
+def callback_captcha(call):
+    user = getattr(call, "from_user", None)
+    if user is None or (get_bool_setting("ignore_bots", IGNORE_BOTS) and getattr(user, "is_bot", False)):
+        return
+    if is_user_blocked(user.id):
+        _ack(call, "🚫 您已被限制访问")
+        return
+    parts = (call.data or "").split("|")
+    if len(parts) < 3:
+        _ack(call)
+        return
+    target_uid = _arg_int(parts, 1)
+    chosen = parts[2]
+    if target_uid != user.id:
+        _ack(call, "❌ 这不是您的验证面板")
+        return
+    if is_user_verified(user.id):
+        _ack(call, "✅ 您已完成过验证")
+        return
+
+    challenge = captcha_challenges.get(user.id)
+    now = time.time()
+    if not challenge or (now - challenge.get("ts", 0) > CAPTCHA_TIMEOUT):
+        challenge = _generate_captcha(user.id)
+        challenge["last_sent"] = now
+        if call.message:
+            show_screen(
+                call.message.chat.id,
+                call.message.message_id,
+                _render_captcha_text(challenge, retry_msg="验证码已过期，请完成新题目："),
+                _build_captcha_keyboard(user.id, challenge),
+            )
+        _ack(call, "验证码已刷新，请重新选择")
+        return
+
+    if chosen == str(challenge["answer"]):
+        verify_user(user.id, getattr(user, "first_name", "") or "", getattr(user, "username", "") or "")
+        spam_stats["captcha_passed"] += 1
+        held_msg = pending_captcha_msgs.pop(user.id, None)
+        _ack(call, "✅ 验证通过！")
+        if call.message:
+            done_text = (
+                "✅ 人机验证通过！您刚才发送的消息已自动转达给主人。"
+                if held_msg is not None
+                else "✅ 人机验证通过！现在您可以直接发送消息，我会匿名转达给主人。"
+            )
+            show_screen(call.message.chat.id, call.message.message_id, done_text, None)
+        if held_msg is not None:
+            _forward_stranger_message(held_msg)
+        return
+
+    # 回答错误
+    challenge["fails"] = challenge.get("fails", 0) + 1
+    spam_stats["captcha_failed"] += 1
+    if CAPTCHA_MAX_FAILS > 0 and challenge["fails"] >= CAPTCHA_MAX_FAILS:
+        block_user(user.id, getattr(user, "first_name", "") or "", getattr(user, "username", "") or "")
+        spam_stats["auto_banned"] += 1
+        logger.warning("用户人机验证失败次数过多自动封禁: %s (%s)", user.first_name, user.id)
+        _ack(call, "🚫 验证失败次数过多")
+        if call.message:
+            show_screen(
+                call.message.chat.id,
+                call.message.message_id,
+                "🚫 验证失败次数过多，您已被系统限制访问。",
+                None,
+            )
+        return
+
+    left = max(1, CAPTCHA_MAX_FAILS - challenge["fails"]) if CAPTCHA_MAX_FAILS > 0 else "若干"
+    new_ch = _generate_captcha(user.id)
+    new_ch["last_sent"] = now
+    _ack(call, f"❌ 答案错误，剩余 {left} 次机会")
+    if call.message:
+        show_screen(
+            call.message.chat.id,
+            call.message.message_id,
+            _render_captcha_text(new_ch, retry_msg=f"回答错误，请重试（剩余 {left} 次机会）："),
+            _build_captcha_keyboard(user.id, new_ch),
+        )
+
+
+def build_quick_ban_kb(sender_id, is_banned=False):
+    if not get_bool_setting("quick_ban_btn", QUICK_BAN_BTN):
+        return None
+    if is_banned:
+        return kb_rows([[
+            btn("✅ 已封禁 (点击解封)", f"qunban|{sender_id}"),
+            btn("👤 用户面板", f"m|user|{sender_id}|0"),
+        ]])
+    return kb_rows([[
+        btn("🚫 一键封禁", f"qban|{sender_id}"),
+        btn("👤 用户面板", f"m|user|{sender_id}|0"),
+    ]])
+
+
+@bot.callback_query_handler(func=lambda call: (call.data or "").startswith(("qban|", "qunban|")))
+def callback_quick_ban(call):
+    if not is_owner(call.from_user.id):
+        _ack(call, "❌ 仅限 owner")
+        return
+    parts = (call.data or "").split("|")
+    act = parts[0]
+    sid = _arg_int(parts, 1)
+    if sid is None:
+        _ack(call, "参数错误")
+        return
+    conv = get_conversation(sid)
+    name = _conv_name(conv)
+    if act == "qban":
+        block_user(sid)
+        logger.info("快捷封禁用户: %s (%s)", sid, name)
+        _ack(call, f"🚫 已封禁: {name}")
+        if call.message:
+            try:
+                bot.edit_message_reply_markup(
+                    call.message.chat.id,
+                    call.message.message_id,
+                    reply_markup=build_quick_ban_kb(sid, is_banned=True),
+                )
+            except Exception:
+                pass
+    else:
+        unblock_user(sid)
+        logger.info("快捷解封用户: %s (%s)", sid, name)
+        _ack(call, f"✅ 已解封: {name}")
+        if call.message:
+            try:
+                bot.edit_message_reply_markup(
+                    call.message.chat.id,
+                    call.message.message_id,
+                    reply_markup=build_quick_ban_kb(sid, is_banned=False),
+                )
+            except Exception:
+                pass
+
+
+def _is_forwarded_message(message):
+    return bool(
+        getattr(message, "forward_from", None)
+        or getattr(message, "forward_from_chat", None)
+        or getattr(message, "forward_origin", None)
+        or getattr(message, "forward_sender_name", None)
+        or getattr(message, "forward_date", None)
+    )
+
+
+def _count_urls(message, text):
+    urls = len(_URL_RE.findall(text or ""))
+    for attr in ("entities", "caption_entities"):
+        ents = getattr(message, attr, None) or []
+        for ent in ents:
+            etype = getattr(ent, "type", None) or (ent.get("type") if isinstance(ent, dict) else None)
+            if etype in ("url", "text_link"):
+                urls = max(urls, 1)
+    return urls
+
+
+def _match_blocked_keyword(text):
+    if not text:
+        return None
+    lower = text.lower()
+    for kw in load_keywords():
+        if kw and kw.lower() in lower:
+            return kw
+    return None
+
+
+def check_content_spam(message):
+    """第 3 层防护：检查外部转发、外链洪水与敏感词黑名单。返回 True 表示属于垃圾消息需拦截。"""
+    sender = message.from_user
+    sender_id = sender.id
+    sender_name = getattr(sender, "first_name", "") or "未知"
+    sender_username = getattr(sender, "username", "") or ""
+
+    # 1. 拦截外部转发消息（频道/他人广告转发）
+    if get_bool_setting("block_forwards", BLOCK_FORWARDS) and _is_forwarded_message(message):
+        spam_stats["forward_blocked"] += 1
+        logger.info("拦截外部转发消息: %s (%s)", sender_name, sender_id)
+        now = time.time()
+        if now - forward_warn_ts.get(sender_id, 0) > 60:
+            forward_warn_ts[sender_id] = now
+            try:
+                bot.reply_to(message, "⚠️ 为防止转发广告骚扰，本机器人不接收外部转发的消息，请直接输入文字或发送内容。")
+            except Exception:
+                pass
+        return True
+
+    full_text = f"{getattr(message, 'text', '') or ''}\n{getattr(message, 'caption', '') or ''}\n{sender_name}"
+
+    # 2. 拦截违规链接
+    url_count = _count_urls(message, full_text)
+    if url_count > 0:
+        if get_bool_setting("block_links", BLOCK_LINKS):
+            spam_stats["link_blocked"] += 1
+            logger.info("拦截外链消息(禁外链已开启): %s (%s)", sender_name, sender_id)
+            return True
+        if MAX_URLS > 0 and url_count > MAX_URLS:
+            spam_stats["link_blocked"] += 1
+            logger.info("拦截多链接刷屏消息(%s个链接): %s (%s)", url_count, sender_name, sender_id)
+            return True
+
+    # 3. 敏感词黑名单检查
+    hit_kw = _match_blocked_keyword(full_text)
+    if hit_kw:
+        spam_stats["keyword_blocked"] += 1
+        logger.info("拦截敏感词消息 [%s]: %s (%s)", hit_kw, sender_name, sender_id)
+        if get_bool_setting("keyword_autoban", KEYWORD_AUTOBAN):
+            block_user(sender_id, sender_name, sender_username)
+            spam_stats["auto_banned"] += 1
+            logger.warning("命中敏感词 [%s] 自动封禁用户: %s (%s)", hit_kw, sender_name, sender_id)
+        return True
+
+    return False
+
+
+def _forward_stranger_message(message):
+    """验证通过且内容合规后，执行向 Owner 的消息转发。"""
+    global active_conversation
+    sender_name = message.from_user.first_name or "未知"
+    sender_username = message.from_user.username
+    sender_id = message.from_user.id
+
+    if check_content_spam(message):
+        return
+
+    upsert_conversation(sender_id, sender_name, sender_username or "")
+
+    convos = get_conversations()
+    queue_pos = None
+    for i, c in enumerate(convos, 1):
+        if c["stranger_id"] == sender_id:
+            queue_pos = i
+            break
+    with conversation_lock:
+        if not active_conversation:
+            active_conversation = sender_id
+
+    announced = should_announce_media_group(sender_id, message)
+    if announced:
+        if MSG_HEADER:
+            header = MSG_HEADER.replace("{name}", sender_name)
+            if sender_username:
+                header = header.replace("{username}", sender_username)
+            else:
+                header = header.replace(" (@{username})", "").replace("@{username}", "")
+            header = header.replace("{id}", str(sender_id))
+            header = header.replace("{queue}", str(queue_pos))
+            header = header.replace("{total}", str(len(convos)))
+        else:
+            header = f"📩 来自：{sender_name}"
+            if sender_username:
+                header += f" (@{sender_username})"
+            header += f"\nID: `{sender_id}`"
+            header += f"\n队列: #{queue_pos}/{len(convos)}  "
+            header += "⬅ 当前" if active_conversation == sender_id else ""
+        qban_kb = build_quick_ban_kb(sender_id)
+        if qban_kb is not None:
+            bot.send_message(OWNER_ID, header, parse_mode="Markdown", reply_markup=qban_kb)
+        else:
+            bot.send_message(OWNER_ID, header, parse_mode="Markdown")
+    random_delay(0.5, 1.8)
+    forwarded = bot.copy_message(
+        chat_id=OWNER_ID,
+        from_chat_id=message.chat.id,
+        message_id=message.message_id,
+    )
+    with conversation_lock:
+        forwarded_msg_map[forwarded.message_id] = sender_id
+    if announced and MSG_FOOTER:
+        footer = MSG_FOOTER.replace("{name}", sender_name).replace("{id}", str(sender_id))
+        bot.send_message(OWNER_ID, footer, parse_mode="Markdown")
+
+    log_message(sender_id, "from_stranger", message_kind(message), message_preview(message),
+                owner_msg_id=forwarded.message_id)
+    logger.info("转发: %s (%s) -> owner, 队列 #%s", sender_name, sender_id, queue_pos)
+
+
 @bot.message_handler(func=lambda m: True, content_types=RELAY_CONTENT_TYPES)
 def handle_all(message):
     global active_conversation
+    if should_drop_by_source(message):
+        return
     user_id = message.from_user.id
+
+    if not is_owner(user_id) and is_user_blocked(user_id):
+        spam_stats["blacklist_dropped"] += 1
+        return
 
     # 菜单向导进行中时，下一条文字只完成当前步骤，不转发出去。
     if consume_menu_input(message):
@@ -2506,6 +3415,7 @@ def handle_all(message):
             with conversation_lock:
                 active_conversation = target_id
             upsert_conversation(target_id)
+            verify_user(target_id)
             log_message(target_id, "to_stranger", message_kind(message), message_preview(message))
             logger.info("回复: owner -> %s", target_id)
         except Exception as e:
@@ -2513,68 +3423,24 @@ def handle_all(message):
             bot.reply_to(message, f"❌ 发送失败：{e}")
         return
 
-    # ==================== 陌生人发消息 → 转发给 owner ====================
+    # ==================== 陌生人发消息 → 防骚扰校验后转发给 owner ====================
     if not is_owner(user_id):
         sender_name = message.from_user.first_name or "未知"
-        sender_username = message.from_user.username
         sender_id = message.from_user.id
 
-        # 封禁检查
-        conv = get_conversation(sender_id)
-        if conv and conv.get("is_blocked"):
-            return
-
-        # 速率限制
+        # 速率限制（含超限自动封禁）
         if not check_rate_limit(sender_id):
             logger.info("陌生人速率限制: %s (%s)", sender_name, sender_id)
             return
 
-        upsert_conversation(sender_id, sender_name, sender_username or "")
+        # 人机验证拦截（未验证访客先暂存首条消息并弹出验证码，不打扰主人）
+        if get_captcha_mode() != "off" and not is_user_verified(sender_id):
+            if sender_id not in pending_captcha_msgs:
+                pending_captcha_msgs[sender_id] = message
+            send_captcha_challenge(message)
+            return
 
-        convos = get_conversations()
-        queue_pos = None
-        for i, c in enumerate(convos, 1):
-            if c["stranger_id"] == sender_id:
-                queue_pos = i
-                break
-        with conversation_lock:
-            if not active_conversation:
-                active_conversation = sender_id
-
-        announced = should_announce_media_group(sender_id, message)
-        if announced:
-            if MSG_HEADER:
-                header = MSG_HEADER.replace("{name}", sender_name)
-                if sender_username:
-                    header = header.replace("{username}", sender_username)
-                else:
-                    header = header.replace(" (@{username})", "").replace("@{username}", "")
-                header = header.replace("{id}", str(sender_id))
-                header = header.replace("{queue}", str(queue_pos))
-                header = header.replace("{total}", str(len(convos)))
-            else:
-                header = f"📩 来自：{sender_name}"
-                if sender_username:
-                    header += f" (@{sender_username})"
-                header += f"\nID: `{sender_id}`"
-                header += f"\n队列: #{queue_pos}/{len(convos)}  "
-                header += "⬅ 当前" if active_conversation == sender_id else ""
-            bot.send_message(OWNER_ID, header, parse_mode="Markdown")
-        random_delay(0.5, 1.8)
-        forwarded = bot.copy_message(
-            chat_id=OWNER_ID,
-            from_chat_id=message.chat.id,
-            message_id=message.message_id,
-        )
-        with conversation_lock:
-            forwarded_msg_map[forwarded.message_id] = sender_id
-        if announced and MSG_FOOTER:
-            footer = MSG_FOOTER.replace("{name}", sender_name).replace("{id}", str(sender_id))
-            bot.send_message(OWNER_ID, footer, parse_mode="Markdown")
-
-        log_message(sender_id, "from_stranger", message_kind(message), message_preview(message),
-                    owner_msg_id=forwarded.message_id)
-        logger.info("转发: %s (%s) -> owner, 队列 #%s", sender_name, sender_id, queue_pos)
+        _forward_stranger_message(message)
         return
 
     # ==================== Owner 直接发消息 → 发给当前活跃对话 ====================
@@ -2589,6 +3455,7 @@ def handle_all(message):
                 from_chat_id=message.chat.id,
                 message_id=message.message_id,
             )
+            verify_user(active_conversation)
             log_message(active_conversation, "to_stranger", message_kind(message), message_preview(message))
             conv = get_conversation(active_conversation)
             name = (conv["first_name"] if conv else "未知") or "未知"
@@ -2615,10 +3482,18 @@ def _install_command_pending_reset():
 
         def _make(fn):
             def wrapped(message, *args, **kwargs):
+                if should_drop_by_source(message):
+                    return
                 user = getattr(message, "from_user", None)
+                if user is not None and not is_owner(user.id):
+                    if is_user_blocked(user.id):
+                        spam_stats["blacklist_dropped"] += 1
+                        return
                 text = getattr(message, "text", None) or ""
                 if user is not None and text.startswith("/"):
                     clear_pending(user.id)
+                    if not is_owner(user.id) and not check_rate_limit(user.id):
+                        return
                 return fn(message, *args, **kwargs)
             wrapped._clears_pending = True
             return wrapped
@@ -2657,9 +3532,14 @@ if __name__ == "__main__":
             types.BotCommand("note", "备注用户(Owner)"),
             types.BotCommand("history", "消息记录(Owner)"),
             types.BotCommand("export", "导出对话(Owner)"),
+            types.BotCommand("antispam", "防骚扰控制台(Owner)"),
+            types.BotCommand("verify", "免检验证用户(Owner)"),
             types.BotCommand("ban", "封禁用户(Owner)"),
             types.BotCommand("unban", "解封用户(Owner)"),
             types.BotCommand("banlist", "封禁列表(Owner)"),
+            types.BotCommand("kwlist", "敏感词列表(Owner)"),
+            types.BotCommand("kwadd", "添加敏感词(Owner)"),
+            types.BotCommand("kwdel", "删除敏感词(Owner)"),
             types.BotCommand("del", "删除对话对象(Owner)"),
             types.BotCommand("contacts", "对话卡片面板(Owner)"),
             types.BotCommand("links", "可用链接"),
